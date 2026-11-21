@@ -1,25 +1,22 @@
 import hashlib
+import os
 import random
+import secrets
 import shutil
-import time
+from functools import partial
 from pathlib import Path
 from urllib.parse import quote
-from functools import partial
-
-import os
-import secrets
 
 import pandas as pd
 import streamlit as st
 
 import effects as fxm
-import hlsprobe
 import mediatools as mt
-import preview as pv
+import renderer
 import services as svc
 import uploader
 
-st.set_page_config(page_title="Studio Render & Live", page_icon="📡", layout="wide")
+st.set_page_config(page_title="Studio Render", page_icon="🎬", layout="wide")
 
 
 KIND_LABEL = {"video": "🎞️ Video", "audio": "🎵 Audio", "output": "📦 Hasil",
@@ -40,11 +37,6 @@ def get_runner(name: str, workers: int) -> svc.JobRunner:
 
 
 @st.cache_resource
-def get_stream() -> svc.StreamManager:
-    return svc.StreamManager()
-
-
-@st.cache_resource
 def get_upload_server():
     """Server upload resumable di port sendiri (default 8502) + tunnel opsional."""
     port = int(os.environ.get("UPLOAD_PORT", "8502"))
@@ -61,8 +53,7 @@ def get_upload_server():
 
 
 dl_jobs = get_runner("download", 2)   # 2 unduhan paralel
-jobs = get_runner("process", 1)       # render/merge satu per satu (hemat CPU/RAM)
-stream = get_stream()
+jobs = get_runner("process", 1)       # render/normalisasi satu per satu (hemat CPU/RAM)
 
 if shutil.which("ffmpeg") is None:
     st.error("ffmpeg tidak ditemukan. Pastikan `packages.txt` berisi `ffmpeg`.")
@@ -70,31 +61,46 @@ if shutil.which("ffmpeg") is None:
 
 
 def protected_files():
-    return list(stream.files) if stream.running else []
+    """File yang sedang dipakai render tidak boleh dihapus/dipindah dari Library."""
+    return renderer.active_files()
 
 
-HLS_PLAYER = """<style>body{margin:0;font:13px system-ui;color:#888}
-.w{overflow:hidden;background:#000;border-radius:8px}
-video{width:100%;max-height:360px;display:block;transform-origin:center;transition:transform .25s}
-.b{margin-top:6px;display:flex;gap:6px;align-items:center}
-button{padding:4px 10px;border-radius:6px;border:1px solid #888;background:transparent;color:inherit;cursor:pointer}</style>
-<div class="w"><video id="v" controls playsinline muted></video></div>
-<div class="b"><button onclick="z(-.25)">🔍 −</button><button onclick="z(0,1)">1×</button>
-<button onclick="z(.25)">🔍 +</button><span id="s">memuat…</span></div>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
-<script>
-const u="__URL__",v=document.getElementById("v"),s=document.getElementById("s");let k=1;
-function z(d,r){k=r?1:Math.min(3,Math.max(1,k+d));v.style.transform="scale("+k+")";}
-if(v.canPlayType("application/vnd.apple.mpegurl")){v.src=u;s.textContent="HLS native"}
-else if(window.Hls&&Hls.isSupported()){const h=new Hls();h.loadSource(u);h.attachMedia(v);
- h.on(Hls.Events.MANIFEST_PARSED,()=>s.textContent="HLS siap");
- h.on(Hls.Events.ERROR,(e,d)=>{if(d.fatal)s.textContent="gagal memuat: "+d.details+" (cek alamat server / tunnel)"})}
-else s.textContent="browser tidak mendukung HLS";
-</script>"""
+def _mmss(sec: float) -> str:
+    sec = int(sec)
+    return f"{sec // 3600}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
+
+
+@st.cache_data(show_spinner=False)
+def _dur(path_str: str, mtime: float) -> float:
+    return svc.media_info(path_str)["dur"]
+
+
+def file_actions(sel: Path, kind: str, key: str) -> None:
+    """Preview + tombol download untuk satu file Library (dipakai tab Render)."""
+    mb = sel.stat().st_size / 1024 / 1024
+    _srv, _tn = get_upload_server()
+    fq = f"/file?kind={kind}&name={quote(sel.name)}&t={_srv.token}"
+    base_url = _tn.url if _tn.running and _tn.url else None
+    ext = sel.suffix.lower()
+    if ext in svc.VIDEO_EXTS and mb < 200:
+        st.video(str(sel))
+    elif ext in svc.VIDEO_EXTS and base_url:
+        st.components.v1.html(f'<video controls preload="metadata" style="width:100%;max-height:420px" '
+                              f'src="{base_url}{fq}"></video>', height=440)
+    else:
+        st.caption("Preview file besar butuh tunnel (buka dari tab Impor → Upload file besar).")
+    if mb < 300:
+        st.download_button(f"⬇️ Download {sel.name} ({mb:,.1f} MB)", sel.read_bytes(), file_name=sel.name,
+                           key=f"{key}_dl", type="primary")
+    elif base_url:
+        st.link_button(f"⬇️ Download {mb:.0f} MB (streaming, bisa dilanjut)", f"{base_url}{fq}&dl=1")
+    else:
+        st.caption(f"File {mb:.0f} MB: buka tunnel di tab Impor dulu agar link download streaming muncul "
+                   "(tanpa batas ukuran, tidak memakai RAM).")
 
 
 def fx_panel(prefix: str) -> dict:
-    """Panel efek visual. Dict hasilnya dipakai sama persis oleh preview, cache efek, dan live."""
+    """Panel efek visual. Dict hasilnya diteruskan ke renderer.run_render."""
     thumbs = svc.list_paths("thumb")
     gifs = [p for p in thumbs if p.suffix.lower() == ".gif"]
     txts = [p for p in svc.list_paths("other") if p.suffix.lower() == ".txt"]
@@ -109,7 +115,7 @@ def fx_panel(prefix: str) -> dict:
 
         # ── crop (default) + zoom animasi opsional ──
         with tabs[0]:
-            crop_on = st.checkbox("Crop tetap (video tampil lebih 'maju', bukan fit-in)", value=True, key=K("crop"),
+            crop_on = st.checkbox("Crop tetap (video tampil lebih 'maju', bukan fit-in)", value=False, key=K("crop"),
                                   help="Video diperbesar lalu tepinya dipotong, hasilnya tetap dan jadi default. "
                                        "Matikan untuk kembali ke tampilan fit-in biasa.")
             c1, c2 = st.columns(2)
@@ -260,15 +266,14 @@ def jobs_table(rows, key=""):
 
 # ───────────── sidebar ─────────────
 with st.sidebar:
-    st.title("📡 Studio")
+    st.title("🎬 Studio Render")
     di = _disk_info()
     c1, c2 = st.columns(2)
     c1.metric("Disk kosong", f"{di['free_gb']:.1f} GB")
     c2.metric("Data app", f"{di['data_gb']:.2f} GB")
     disk_min = st.number_input("Batas minimum sisa disk (GB)", 0.0, 50.0, 0.5, 0.1, key="disk_min",
-                               help="Unduh, render, dan merge dibatalkan jika sisa disk di bawah angka ini.")
-    st.caption(f"Antrean — unduh: {dl_jobs.pending()} · render/merge: {jobs.pending()}")
-    st.caption("🔴 Live: " + ("berjalan" if stream.running else "mati"))
+                               help="Unduh, render, dan normalisasi dibatalkan jika sisa disk di bawah angka ini.")
+    st.caption(f"Antrean — unduh: {dl_jobs.pending()} · render/normalisasi: {jobs.pending()}")
     if st.button("🧹 Bersihkan folder tmp", width="stretch"):
         if dl_jobs.pending() or jobs.pending():
             st.toast("Tunggu semua job selesai dulu.")
@@ -282,13 +287,240 @@ with st.sidebar:
         st.write(("✅ yt-dlp " + ts["yt-dlp"]) if ts["yt-dlp"] else "❌ yt-dlp")
     st.divider()
     st.caption("⚠️ Penyimpanan Streamlit Cloud tidak permanen. File bisa hilang saat app "
-               "restart/redeploy; download hasil penting dari tab Library.")
+               "restart/redeploy; download hasil penting dari tab Render atau Library.")
 
-st.title("Studio Render & Live")
+st.title("Studio Render")
 
-tab_lib, tab_imp, tab_norm, tab_live, tab_seq, tab_playlist, tab_jobs = st.tabs(
-    ["📁 Library", "⬇️ Impor", "🧰 Normalisasi & Tes", "🔴 Live 24 Jam", "🎞️ Video Berurutan",
-     "🔁 Multi-stream berurutan", "⚙️ Job"])
+tab_render, tab_lib, tab_imp, tab_norm, tab_jobs = st.tabs(
+    ["🎬 Render", "📁 Library", "⬇️ Impor", "🧰 Normalisasi & Tes", "⚙️ Job"])
+
+# ───────────── RENDER ─────────────
+def _rd_items() -> list:
+    return list(st.session_state.get("rd_order", []))
+
+
+def _rd_add():
+    add = [str(p) for p in (st.session_state.get("rd_add") or [])]
+    st.session_state["rd_order"] = [*_rd_items(), *add]
+    st.session_state["rd_add"] = []
+
+
+def _rd_move(i: int, delta: int):
+    o = _rd_items()
+    j = i + delta
+    if 0 <= i < len(o) and 0 <= j < len(o):
+        o[i], o[j] = o[j], o[i]
+        st.session_state["rd_order"] = o
+
+
+def _rd_top(i: int):
+    o = _rd_items()
+    if 0 < i < len(o):
+        o.insert(0, o.pop(i))
+        st.session_state["rd_order"] = o
+
+
+def _rd_del(i: int):
+    o = _rd_items()
+    if 0 <= i < len(o):
+        o.pop(i)
+        st.session_state["rd_order"] = o
+
+
+def _rd_clear():
+    st.session_state["rd_order"] = []
+
+
+def _rd_sort():
+    st.session_state["rd_order"] = sorted(_rd_items(), key=lambda s: Path(s).name.lower())
+
+
+def _rd_shuffle():
+    o = _rd_items()
+    random.shuffle(o)
+    st.session_state["rd_order"] = o
+
+
+@st.cache_data(show_spinner=False)
+def _analyze(paths: tuple, stamps: tuple) -> dict:
+    return renderer.analyze([Path(p) for p in paths])
+
+
+with tab_render:
+    st.markdown("### 🎬 Render — gabung banyak video jadi 1 video")
+    st.caption("Susun video → pilih mode → **Render**. Hasil otomatis tersimpan di Library (📦 Hasil) dan "
+               "bisa langsung diunduh dari bagian bawah tab ini.")
+
+    rd_vlib = svc.library_videos()
+    if not rd_vlib:
+        st.warning("Library video masih kosong. Tambahkan video lewat tab **Impor**.")
+    order = [p for p in _rd_items() if Path(p).is_file()]       # buang file yang sudah dihapus dari Library
+    if order != _rd_items():
+        st.session_state["rd_order"] = order
+
+    # ── 1. susun urutan ──
+    st.markdown("#### 1️⃣ Susun urutan video")
+    a1, a2 = st.columns([5, 1.2], vertical_alignment="bottom")
+    a1.multiselect("Tambah video ke urutan (sesuai urutan klik; video yang sama boleh ditambahkan lagi)",
+                   rd_vlib, format_func=svc.label, key="rd_add", placeholder="Pilih satu atau beberapa video...")
+    a2.button("➕ Tambahkan", key="rd_addbtn", on_click=_rd_add, width="stretch",
+              disabled=not st.session_state.get("rd_add"))
+
+    if order:
+        for i, ps in enumerate(order):
+            p = Path(ps)
+            c0, c1, c2, c3, c4, c5, c6 = st.columns([0.5, 5, 1.2, 0.6, 0.6, 0.6, 0.6], vertical_alignment="center")
+            c0.markdown(f"**{i + 1}**")
+            c1.write(svc.label(p))
+            c2.caption(_mmss(_dur(ps, p.stat().st_mtime)))
+            c3.button("⏫", key=f"rd_top_{i}", on_click=_rd_top, args=(i,), disabled=i == 0,
+                      help="Pindahkan ke paling atas")
+            c4.button("🔼", key=f"rd_up_{i}", on_click=_rd_move, args=(i, -1), disabled=i == 0,
+                      help="Naik satu posisi")
+            c5.button("🔽", key=f"rd_dn_{i}", on_click=_rd_move, args=(i, 1), disabled=i == len(order) - 1,
+                      help="Turun satu posisi")
+            c6.button("❌", key=f"rd_rm_{i}", on_click=_rd_del, args=(i,), help="Hapus dari urutan")
+        t1, t2, t3, _ = st.columns([1, 1, 1, 3])
+        t1.button("🔤 Urut A–Z", key="rd_sort", on_click=_rd_sort, width="stretch")
+        t2.button("🔀 Acak sekali", key="rd_shuf", on_click=_rd_shuffle, width="stretch")
+        t3.button("🧹 Kosongkan", key="rd_clr", on_click=_rd_clear, width="stretch")
+        stamps = tuple(Path(p).stat().st_mtime_ns for p in order)
+        an = _analyze(tuple(order), stamps)
+    else:
+        st.info("Urutan masih kosong. Pilih video di atas lalu klik **Tambahkan**.")
+        an = None
+
+    uniform = bool(an and an.get("ok") and an["uniform"])
+    if an and not an.get("ok"):
+        st.error(an["error"])
+    elif an:
+        if uniform:
+            st.success(f"{len(order)} video · total {_mmss(an['total'])} · format seragam ({an['first']}) → "
+                       "bisa digabung **tanpa re-encode** (copy, tercepat).")
+        else:
+            st.warning(f"{len(order)} video · total {_mmss(an['total'])} · format berbeda "
+                       f"({an['n_formats']} jenis): {an['reason']}. Mode Auto akan menyeragamkan dulu "
+                       "(re-encode), atau pakai tab Normalisasi.")
+
+    # ── 2. mode & kualitas ──
+    st.markdown("#### 2️⃣ Mode gabung & kualitas")
+    rd_mode = st.radio("Mode video", list(renderer.MODE_LABEL), key="rd_mode",
+                       format_func=renderer.MODE_LABEL.get)
+    with st.expander("⚙️ Ukuran, FPS & kualitas (dipakai saat re-encode / efek)",
+                     expanded=rd_mode == "encode"):
+        q1, q2, q3 = st.columns(3)
+        rd_res = q1.selectbox("Resolusi", list(renderer.RES_OPTIONS), format_func=renderer.RES_LABEL.get,
+                              key="rd_res")
+        rd_fps = q2.selectbox("FPS", [0, 24, 25, 30, 60], format_func=lambda v: "Ikut klip pertama" if not v else f"{v} fps",
+                              key="rd_fps")
+        rd_fit = q3.radio("Penyesuaian layar", list(renderer.FIT_LABEL), format_func=renderer.FIT_LABEL.get,
+                          key="rd_fit")
+        q4, q5 = st.columns(2)
+        rd_crf = q4.slider("Kualitas (CRF — makin kecil makin tajam & besar)", 16, 30, 21, key="rd_crf",
+                           help="18 ≈ hampir tanpa kehilangan, 21 seimbang, 26+ hemat ukuran.")
+        rd_preset = q5.selectbox("Kecepatan encode", renderer.PRESETS, index=2, key="rd_preset",
+                                 help="Lebih lambat = file lebih kecil untuk kualitas yang sama.")
+        st.caption("Pengaturan ini diabaikan oleh mode Copy.")
+
+    # ── 3. audio ──
+    st.markdown("#### 3️⃣ Audio")
+    rd_amode = st.radio("Sumber audio", list(renderer.AUDIO_LABEL), key="rd_amode", horizontal=True,
+                        format_func=renderer.AUDIO_LABEL.get)
+    rd_afiles, rd_ashuf, rd_vbg, rd_vvid = [], False, 1.0, 1.0
+    if rd_amode != "keep":
+        alib = svc.list_paths("audio")
+        if not alib:
+            st.warning("Folder audio kosong. Tambahkan file audio lewat tab **Impor**; tanpa file audio, "
+                       "audio bawaan video yang dipakai.")
+        rd_afiles = st.multiselect("File audio (diputar berurutan, diulang otomatis sampai video selesai)",
+                                   alib, format_func=lambda p: p.name, key="rd_afiles")
+        v1, v2, v3 = st.columns(3)
+        rd_ashuf = v1.checkbox("Acak urutan audio", key="rd_ashuf")
+        rd_vbg = v2.slider("Volume audio latar", 0.0, 2.0, 1.0 if rd_amode == "replace" else 0.6, 0.05,
+                           key=f"rd_vbg_{rd_amode}")
+        rd_vvid = v3.slider("Volume audio video", 0.0, 2.0, 1.0, 0.05, key="rd_vvid",
+                            disabled=rd_amode != "mix")
+
+    # ── 4. efek ──
+    st.markdown("#### 4️⃣ Efek visual (opsional)")
+    with st.expander("✨ Crop, warna, teks, gambar, GIF…"):
+        rd_fx = fx_panel("rd")
+    fx_on = fxm.active(rd_fx)
+    if fx_on:
+        st.info("Efek aktif → video di-encode ulang satu kali pada hasil gabungan (lebih lama dari mode copy).")
+        for w in fxm.warnings(rd_fx):
+            st.warning(w)
+
+    # ── 5. ulangi & simpan ──
+    st.markdown("#### 5️⃣ Pengulangan & nama file")
+    r1, r2, r3 = st.columns(3)
+    rd_repeat = r1.number_input("Ulangi daftar (kali)", 1, 500, 1, 1, key="rd_repeat")
+    rd_target = r2.number_input("…atau sampai durasi (menit, 0 = nonaktif)", 0.0, 1440.0, 0.0, 1.0,
+                                key="rd_target", help="Jika diisi, daftar diulang sampai durasi ini lalu dipotong.")
+    rd_shuf_cycle = r3.checkbox("Acak urutan tiap putaran", key="rd_shufc",
+                                help="Berlaku saat daftar diulang lebih dari sekali.")
+    rd_name = st.text_input("Nama file hasil", key="rd_name", placeholder="kosong = gabungan_TANGGAL_JAM.mp4")
+
+    if an and an.get("ok"):
+        out_sec = rd_target * 60 if rd_target > 0 else an["total"] * rd_repeat
+        st.caption(f"Perkiraan durasi hasil: **{_mmss(out_sec)}**")
+
+    blocked = ""
+    if not order:
+        blocked = "Susun minimal 1 video dulu."
+    elif an and not an.get("ok"):
+        blocked = "Ada video yang tidak valid."
+    elif rd_mode == "copy" and not uniform and not fx_on:
+        blocked = "Mode Copy butuh format seragam. Pakai mode Auto atau Re-encode."
+    elif rd_amode != "keep" and not rd_afiles:
+        blocked = "Pilih minimal 1 file audio, atau ganti sumber audio ke “bawaan video”."
+    if blocked:
+        st.caption(f"⛔ {blocked}")
+
+    if st.button("🎬 Render sekarang", type="primary", key="rd_go", disabled=bool(blocked), width="stretch"):
+        spec = {"clips": list(order), "shuffle": rd_shuf_cycle, "repeat": int(rd_repeat),
+                "target_min": float(rd_target), "mode": rd_mode, "res": rd_res, "fps": int(rd_fps),
+                "crf": int(rd_crf), "preset": rd_preset, "fit": rd_fit, "audio_mode": rd_amode,
+                "audio_files": [str(p) for p in rd_afiles], "audio_shuffle": rd_ashuf,
+                "vol_video": rd_vvid, "vol_bg": rd_vbg, "fx": rd_fx if fx_on else None,
+                "out_name": rd_name}
+        title = f"Render · {svc.safe_name(rd_name) if rd_name.strip() else f'{len(order)} video digabung'}"
+        jobs.submit(title, partial(renderer.run_render, spec=spec, disk_min_gb=disk_min))
+        st.toast("Render diantrekan. Pantau progres di bawah.")
+
+    # ── progres & hasil ──
+    st.markdown("#### 📊 Progres")
+
+    @st.fragment(run_every=2)
+    def render_progress():
+        act = [j for j in jobs.active() if j["title"].startswith("Render")]
+        was = st.session_state.get("rd_was_active", False)
+        st.session_state["rd_was_active"] = bool(act)
+        if was and not act:                      # render baru selesai → segarkan daftar hasil di bawah
+            st.rerun()
+        for j in act:
+            st.progress(min(1.0, j["progress"]),
+                        text=f"{j['title']} — {STATUS_ICON.get(j['status'], j['status'])} · {j['detail']}")
+        if any(j["status"] == "berjalan" for j in act):
+            if st.button("⏹ Hentikan render yang berjalan", key="rd_stop"):
+                st.toast(f"{jobs.stop_running()} render dihentikan")
+        rows = [r for r in jobs.snapshot() if str(r["Job"]).startswith("Render")][:5]
+        if rows:
+            jobs_table(rows)
+        elif not act:
+            st.caption("Belum ada render.")
+
+    render_progress()
+
+    st.markdown("#### 📦 Hasil render (tersimpan di Library → Hasil)")
+    outs = sorted(svc.list_paths("output"), key=lambda p: p.stat().st_mtime, reverse=True)[:30]
+    if not outs:
+        st.caption("Belum ada hasil. Hasil render muncul di sini dan di Library → 📦 Hasil.")
+    else:
+        sel_out = st.selectbox("File hasil (terbaru di atas)", outs, format_func=lambda p: f"{p.name} · "
+                               f"{p.stat().st_size / 1024 / 1024:,.1f} MB", key="rd_result")
+        if sel_out is not None:
+            file_actions(sel_out, "output", "rd_res")
 
 # ───────────── LIBRARY ─────────────
 with tab_lib:
@@ -297,7 +529,7 @@ with tab_lib:
                     format_func=lambda k: f"{KIND_LABEL[k]} ({counts[k]})")
     files = svc.list_files(kind)
     if not files:
-        st.info("Folder kosong. Tambahkan file lewat tab **Impor**.")
+        st.info("Folder kosong. Tambahkan file lewat tab **Impor**; hasil render ada di 📦 Hasil.")
     else:
         q = st.text_input("🔎 Cari file", key=f"lib_q_{kind}", placeholder="ketik sebagian nama file…")
         shown = [f for f in files if q.lower() in f["name"].lower()] if q else files
@@ -335,7 +567,7 @@ with tab_lib:
                     st.session_state[all_k] = False
                     st.session_state[ver_k] = st.session_state.get(ver_k, 0) + 1
                     skipped = len(chosen) - n
-                    st.toast(f"{n} file dihapus" + (f" · {skipped} dilewati (sedang dipakai live)" if skipped else ""))
+                    st.toast(f"{n} file dihapus" + (f" · {skipped} dilewati (sedang dipakai render)" if skipped else ""))
                     st.rerun()
             dest = b_.selectbox("Pindahkan ke", [k for k in svc.DIRS if k != kind],
                                 format_func=lambda k: KIND_LABEL[k], label_visibility="collapsed")
@@ -582,7 +814,7 @@ def _report(rows: list, kind: str, key: str, tgt_audio=None) -> dict:
     if S["uniform"]:
         st.success("Semua file seragam dan aman dipakai.")
     elif S["bad"]:
-        st.error(f"{S['bad']} file bermasalah (rusak / terpotong / senyap). Jangan dipakai live: ganti atau hapus.")
+        st.error(f"{S['bad']} file bermasalah (rusak / terpotong / senyap). Jangan dipakai render: ganti atau hapus.")
     else:
         st.warning(f"{S['warn']} file belum seragam. Jalankan normalisasi di bawah.")
     for n in S["notes"]:
@@ -599,13 +831,10 @@ def _report(rows: list, kind: str, key: str, tgt_audio=None) -> dict:
 
 
 with tab_norm:
-    st.caption("Samakan format semua file agar live stabil dan volume tidak naik-turun: audio → AAC .m4a "
+    st.caption("Samakan format semua file agar penggabungan bisa memakai mode copy (cepat) dan volume tidak naik-turun: audio → AAC .m4a "
                "(sample rate, channel, bitrate, loudness seragam), video → H.264 dengan ukuran & FPS seragam. "
                "Alur: **Tes** dulu untuk melihat mana yang tidak seragam, lalu **Normalisasi**. Hasil ditulis ke "
                "file sementara, diverifikasi, baru masuk Library.")
-    if stream.running:
-        st.warning("Live sedang berjalan. Tes & normalisasi berjalan dengan prioritas rendah, tetapi tetap memakai "
-                   "CPU; untuk live yang paling aman, lakukan saat live mati atau batasi thread di bawah.")
     n_aud, n_vid = st.tabs(["🎵 Audio (AAC / M4A)", "🎞️ Video (H.264 seragam)"])
 
     # ---------------- AUDIO ----------------
@@ -745,916 +974,6 @@ with tab_norm:
 
     norm_status()
 
-# ───────────── LIVE ─────────────
-def _mmss(sec: float) -> str:
-    sec = int(sec)
-    return f"{sec // 3600}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
-
-
-@st.cache_data(show_spinner=False)
-def _dur(path_str: str, mtime: float) -> float:
-    return svc.media_info(path_str)["dur"]
-
-
-VOL_DEFAULT = {"l_vrand": 1.0, "l_vloop": 0.6}
-
-
-def _push_vol():
-    """Teruskan posisi slider ke stream yang sedang berjalan (tanpa restart)."""
-    if "l_vrand" in st.session_state:
-        stream.set_volume("r", st.session_state["l_vrand"])
-    if "l_vloop" in st.session_state:
-        stream.set_volume("l", st.session_state["l_vloop"])
-
-
-def _reset_vol():
-    st.session_state.update(VOL_DEFAULT)
-    _push_vol()
-
-
-with tab_live:
-    st.markdown("#### 🌐 Sumber video dari link HLS (.m3u8)")
-    hls_on = st.toggle("Pakai link HLS sebagai video (tanpa file di Library)", key="l_hls_on",
-                       help="Video diambil langsung dari link .m3u8, efek zoom/overlay tetap bisa dipakai. "
-                            "Audio tetap dari file audio yang kamu pilih.")
-    hls_url, hls_vod = "", False
-    if hls_on:
-        hc1, hc2 = st.columns([4, 1])
-        hls_url = hc1.text_input("Link .m3u8", key="l_hls_url", placeholder="https://contoh.com/live/index.m3u8"
-                                 ).strip()
-        hc2.write("")
-        if hc2.button("🔍 Cek link", key="l_hls_chk", width="stretch", disabled=not hls_url):
-            with st.spinner("Membaca playlist..."):
-                st.session_state["hls_probe"] = hlsprobe.probe(hls_url)
-        pr_ = st.session_state.get("hls_probe")
-        if pr_ and pr_.get("url") == hls_url:
-            if pr_["ok"]:
-                v_ = pr_["v"]
-                hls_vod = bool(pr_["vod"])
-                st.success(f"Link terbaca · {'LIVE' if pr_['live'] else 'VOD'} · "
-                           f"{v_['w']}x{v_['h']} @ {v_['fps']:g} fps · {v_['codec']}"
-                           + (f" · audio {pr_['a']['codec']}" if pr_.get("a") else " · tanpa audio"))
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Jenis", "Master (multi-kualitas)" if pr_["kind"] == "master" else "Media")
-                m2.metric("Kualitas tersedia", len(pr_["variants"]) or 1)
-                m3.metric("Durasi", "Live" if pr_["live"] else _mmss(pr_["duration"]))
-                for w_ in pr_["warnings"]:
-                    st.caption("• " + w_)
-            else:
-                st.error(pr_["error"])
-        elif hls_url and not hlsprobe.valid_url(hls_url):
-            st.error("Link HLS harus diawali http:// atau https://")
-        elif hls_url:
-            st.caption("Klik **Cek link** untuk memeriksa sumber sebelum preview/live.")
-        st.info("Mode HLS: opening/end dan mode terjadwal dimatikan; sumber diputar terus dan otomatis "
-                "menyambung ulang jika putus.")
-
-    program_mode = st.checkbox(
-        "Mode terjadwal: opening → audio → video end → hentikan live",
-        value=False,
-        key="l_program_mode",
-        disabled=hls_on,
-        help="Mode live lama tetap tersedia. Mode terjadwal memutar audio penuh atau sesuai target, "
-             "lalu menunggu video end selesai sebelum menghentikan FFmpeg dan koneksi YouTube.",
-    )
-    st.caption(
-        "Mode terjadwal: opening opsional dipilih acak dan diputar sekali → video utama acak selama audio → "
-        "video end diputar penuh → FFmpeg dan pengiriman ke YouTube dihentikan."
-        if program_mode else
-        "Streaming tunggal ke YouTube Live langsung dari Library. Mode live lama tetap memutar opening "
-        "opsional sekali, video acak berulang, serta audio random kontinu secara independen."
-    )
-    program_mode = program_mode and not hls_on
-    vlib = svc.library_videos()
-    alib = svc.list_paths("audio")
-
-    st.markdown("#### 🎞️ Alur video")
-    use_opening = st.checkbox("Putar opening sekali saat live dimulai", value=True, key="l_open_on", disabled=hls_on)
-    program_video_choice = "Video acak (shuffle)"
-    program_video_mode = "random"
-    if program_mode:
-        program_video_choice = st.radio(
-            "Video selama audio",
-            ["Video acak (shuffle)", "Satu video diulang"],
-            horizontal=True,
-            key="l_program_video_mode",
-        )
-        program_video_mode = "single" if program_video_choice == "Satu video diulang" else "random"
-    f1, f2 = st.columns(2)
-    v_open = f1.multiselect("1️⃣ Opening (acak jika memilih beberapa)", vlib, format_func=svc.label,
-                            key="l_open", placeholder="Pilih video opening...", disabled=not use_opening or hls_on)
-    if program_mode and program_video_mode == "single":
-        single_video = f2.selectbox(
-            "2️⃣ Pilih satu video utama",
-            vlib,
-            format_func=svc.label,
-            key="l_single_video",
-            index=None,
-            placeholder="Pilih satu video untuk diulang...",
-            disabled=not vlib,
-        )
-        v_rand = [single_video] if single_video else []
-    else:
-        main_video_label = ("2️⃣ Video utama acak (selama audio)" if program_mode
-                            else "2️⃣ Video acak (diputar penuh dan berulang)")
-        v_rand = f2.multiselect(main_video_label, vlib, format_func=svc.label,
-                                key="l_rand", placeholder="Pilih video acak...", disabled=hls_on)
-    active_opening = v_open if use_opening and not hls_on else []
-    if hls_on:
-        v_rand, v_end = [], []
-    v_end = st.multiselect(
-        "3️⃣ Video end (acak jika memilih beberapa; diputar penuh)",
-        vlib,
-        format_func=svc.label,
-        key="l_end",
-        placeholder="Pilih video end...",
-        disabled=hls_on,
-    )
-    if program_mode:
-        main_video_caption = (
-            "Satu video utama diulang sampai audio selesai."
-            if program_video_mode == "single"
-            else "Video utama dipilih acak dan diputar penuh selama audio."
-        )
-        st.caption("Opening dipilih acak dan diputar sekali. " + main_video_caption
-                   + " Video end diputar penuh setelahnya, lalu live dihentikan.")
-    else:
-        st.caption("Opening boleh kosong atau dimatikan; live langsung memutar video acak. "
-                   "Setelah opening selesai, video acak terus berjalan. Pilih lebih dari satu opening "
-                   "agar video awal dipilih acak. Video end di atas digunakan jika mode terjadwal diaktifkan.")
-
-    st.markdown("#### 🎵 Audio terjadwal" if program_mode else "#### 🎵 Audio random kontinu")
-    a_rand = st.multiselect(
-        "Pilih file audio" if program_mode else "🎲 Pilih file audio untuk diputar acak terus-menerus",
-        alib,
-        format_func=svc.label,
-        key="l_arand",
-        placeholder="Pilih satu atau beberapa file audio...",
-    )
-    selected_audio_seconds = sum(_dur(str(p), p.stat().st_mtime) for p in a_rand)
-    program_audio_mode = "full"
-    program_audio_seconds = selected_audio_seconds
-    if program_mode:
-        audio_mode_label = st.radio(
-            "Cara memutar audio",
-            ["Urutan pilihan", "Acak urutan semua file", "Gunakan target durasi"],
-            horizontal=True,
-            key="l_program_audio_mode",
-        )
-        program_audio_mode = {
-            "Urutan pilihan": "full",
-            "Acak urutan semua file": "shuffle",
-            "Gunakan target durasi": "target",
-        }[audio_mode_label]
-        if program_audio_mode == "target":
-            program_audio_hours = st.number_input(
-                "Target durasi audio (jam)",
-                min_value=0.05,
-                max_value=720.0,
-                value=1.0,
-                step=0.25,
-                key="l_program_audio_hours",
-                help="Audio diputar acak sampai target; file terakhir dapat terpotong tepat pada batas durasi.",
-            )
-            program_audio_seconds = float(program_audio_hours) * 3600
-        st.caption(
-            f"Total durasi audio terpilih: {_mmss(selected_audio_seconds)}. "
-            + ("Semua file diputar satu kali sesuai urutan pilihan."
-               if program_audio_mode == "full"
-               else "Semua file diputar satu kali dengan urutan acak."
-               if program_audio_mode == "shuffle"
-               else f"Audio diputar acak sampai target {_mmss(program_audio_seconds)}.")
-        )
-    else:
-        st.caption("Setiap file diputar sampai selesai. Jika memilih beberapa file, urutannya diacak tanpa lagu "
-                   "yang sama berturut-turut; setelah semua file diputar, urutan diacak kembali. Satu file akan diputar ulang.")
-
-    loop_sel = st.selectbox("🎼 MP3 latar di bawah visual (diulang terus, dicampur dengan audio utama)", alib,
-                            format_func=svc.label, index=None, key="l_aloop",
-                            placeholder="Opsional — pilih satu file MP3/audio latar...")
-
-    st.markdown("##### 🎚️ Volume (bisa diubah saat live berjalan, langsung terdengar)")
-    for _k, _v in VOL_DEFAULT.items():
-        st.session_state.setdefault(_k, _v)
-    h1, h2, h3 = st.columns([3, 3, 1.4])
-    vol_rand = h1.slider("Volume audio utama", 0.0, 2.0, step=0.05, key="l_vrand", on_change=_push_vol)
-    vol_loop = h2.slider("Volume MP3 latar", 0.0, 2.0, step=0.05, key="l_vloop", on_change=_push_vol,
-                         disabled=loop_sel is None)
-    h3.button("↩️ Default", key="l_vreset", on_click=_reset_vol, width="stretch",
-              help="Kembalikan volume ke default (audio utama 1,00 · MP3 latar 0,60).")
-
-    active_end = v_end if program_mode else []
-    all_v = list(dict.fromkeys([*active_opening, *v_rand, *active_end]))
-    all_a = list(dict.fromkeys([*([loop_sel] if loop_sel else []), *a_rand]))
-    if all_v or all_a:
-        rt = sum(_dur(str(p), p.stat().st_mtime) for p in v_rand)
-        rat = sum(_dur(str(p), p.stat().st_mtime) for p in a_rand)
-        opening_label = f"Opening ({len(active_opening)}) → " if active_opening else ""
-        if program_mode:
-            video_summary = ("1 video diulang" if program_video_mode == "single"
-                             else f"{len(v_rand)} video acak")
-            st.info(f"Alur terjadwal: {opening_label}{video_summary} → "
-                    f"audio {_mmss(program_audio_seconds)} → video end ({len(v_end)} pilihan)")
-        else:
-            st.info(f"Alur: {opening_label}Video acak ({len(v_rand)} file · "
-                    f"{_mmss(rt)} per putaran)   |   Audio random: {len(a_rand)} file · {_mmss(rat)}")
-
-    fx_cfg = fx_panel("lfx")
-    fx_on = fxm.active(fx_cfg)
-    if fx_on:
-        st.caption(f"Efek aktif: {fxm.describe(fx_cfg)}. Efek dibakar SEKALI ke cache H.264 seragam, lalu live "
-                   "mengirimnya tanpa re-encode, jadi koneksi tetap ringan walau ada zoom/overlay/MP3 latar.")
-
-    RTMP_PRESETS = {"RTMP YouTube (standar)": "rtmp://a.rtmp.youtube.com/live2",
-                    "RTMPS YouTube (terenkripsi, lebih tahan putus)": "rtmps://a.rtmps.youtube.com:443/live2",
-                    "Kustom": ""}
-    l0, l1, l2 = st.columns([1.2, 1.2, 1])
-    srv = l0.selectbox("Server tujuan", list(RTMP_PRESETS), key="l_srv")
-    rtmp = l1.text_input("RTMP URL", RTMP_PRESETS[srv] or "rtmp://", key=f"l_rtmp_{srv}",
-                         disabled=srv != "Kustom")
-    skey = l2.text_input("Stream Key", type="password", key="l_key")
-
-    with st.expander("⚙️ Pengaturan lanjutan"):
-        vmode = st.radio("Mode video", ["auto", "normalize", "copy"], horizontal=True, key="l_vmode",
-                         format_func={"auto": "Otomatis (disarankan)",
-                                      "normalize": "Selalu samakan",
-                                      "copy": "Kirim apa adanya"}.get,
-                         help="Otomatis: jika semua video sudah seragam & cocok untuk live, dikirim apa adanya "
-                              "(CPU ≈ 0). Jika tidak, tiap video disamakan SEKALI ke H.264 seragam (disimpan di cache), "
-                              "lalu stream tetap tanpa re-encode. 'Kirim apa adanya' hanya jika kamu yakin file seragam.")
-        n1, n2, n3 = st.columns(3)
-        l_h = n1.selectbox("Resolusi (jika disamakan)", [480, 720, 1080], index=1)
-        l_fps = n2.selectbox("FPS (jika disamakan)", [24, 25, 30], index=2)
-        l_br = n3.selectbox("Bitrate video kbps (jika disamakan)", [0, 1500, 2500, 4000, 6000], index=0,
-                            format_func=lambda b: "Auto (sesuai resolusi, disarankan)" if b == 0 else str(b),
-                            help="Auto: 480p≈1500 · 720p≈3000 · 1080p≈5000 kbps (×1.4 jika FPS di atas 30). "
-                                 "Otomatis diturunkan bertahap jika jaringan upload lambat / sesi sering putus.")
-        o1, o2 = st.columns(2)
-        l_shuf = o1.checkbox("Acak video pada tiap pergantian", value=True, key="l_shuf",
-                             help="Video berikutnya dipilih acak tanpa pengulangan berurutan.")
-        l_hours = o2.number_input("Batas durasi (jam, 0 = tanpa batas)", 0.0, 720.0, 0.0, 1.0,
-                                  key="l_hours", disabled=program_mode)
-        if program_mode:
-            o2.caption("Mode terjadwal berhenti otomatis setelah video end.")
-        l_local = st.checkbox("Mode uji lokal (tidak mengirim ke YouTube)", key="l_local",
-                              help="Keluaran ditulis sebagai HLS lokal dan bisa diputar di bawah. "
-                                   "Stream key tidak diperlukan.")
-        if st.button("🧹 Hapus cache hasil penyamaan", key="l_clrcache"):
-            st.toast(f"{svc.clear_live_cache()} file cache dihapus")
-
-    live_cfg = {"videos": all_v, "audios": all_a,
-                "v_open": active_opening, "v_rand": v_rand,
-                "v_end": v_end, "program_mode": program_mode,
-                "program_video_mode": program_video_mode,
-                "program_audio_mode": program_audio_mode,
-                "program_audio_seconds": program_audio_seconds,
-                "a_loop": [loop_sel] if loop_sel else [], "a_rand": a_rand,
-                "vol_loop": vol_loop, "vol_rand": vol_rand,
-                "rtmp_url": rtmp.strip(), "stream_key": skey.strip(),
-                "vmode": vmode, "height": l_h, "fps": l_fps, "vbr_k": l_br,
-                "shuffle": l_shuf, "disk_min_gb": disk_min, "fx": fx_cfg,
-                "hls_url": hls_url if hls_on else "", "hls_vod": hls_vod,
-                "local_dir": str(svc.LOCAL_LIVE_DIR) if l_local else ""}
-
-    # ----- preview & tata -----
-    st.markdown("#### 🎬 Preview & tata sebelum live")
-    st.caption("Preview memakai pengaturan di atas (opening → video utama → end, zoom/overlay, MP3 latar, volume) "
-               "pada 480p. Jika sudah pas, klik **Stream sesuai preview**: yang dikirim ke YouTube memakai "
-               "pengaturan yang identik.")
-    cur_hash = pv.config_hash(live_cfg)
-    for _w in fxm.warnings(fx_cfg):
-        st.warning(_w)
-    if fx_on and all_v:
-        ready = sum(svc.fx_cache_path(p, live_cfg).exists() for p in all_v)
-        bk1, bk2 = st.columns([2.4, 1])
-        bk1.caption(f"🔥 Cache efek siap: {ready}/{len(all_v)} video. Yang sudah dibakar dikirim tanpa re-encode "
-                    "(paling stabil); yang belum akan di-transkode langsung sementara.")
-        if bk2.button("🔥 Siapkan efek sekarang", key="l_bake", disabled=ready == len(all_v), width="stretch"):
-            bake_cfg = {k: live_cfg[k] for k in ("fx", "height", "fps", "vbr_k")}
-            n_b = 0
-            for p in all_v:
-                if not svc.fx_cache_path(p, live_cfg).exists():
-                    jobs.submit(f"Efek · {p.name}"[:60],
-                                partial(svc.bake_fx, path=p, cfg=bake_cfg, disk_min_gb=disk_min))
-                    n_b += 1
-            st.toast(f"{n_b} job efek diantrekan (progres di tab Job)")
-
-    pc1, pc2 = st.columns([1, 2])
-    pv_sec = pc1.number_input("Detik per bagian", 5, 60, 20, 5, key="pv_sec")
-    if pc2.button("🎬 Buat / perbarui preview", key="pv_go", width="stretch"):
-        if hls_on and not hlsprobe.valid_url(hls_url):
-            st.error("Isi link HLS yang valid (http:// atau https://).")
-        elif not hls_on and not v_rand:
-            st.error("Pilih minimal satu video utama.")
-        elif not a_rand and not loop_sel:
-            st.error("Pilih minimal satu file audio.")
-        else:
-            try:
-                with st.spinner("Membuat preview..."):
-                    st.session_state["pv_state"] = pv.build(live_cfg, int(pv_sec))
-            except Exception as e:  # noqa: BLE001
-                st.error(f"Preview gagal: {e}")
-
-    ps = st.session_state.get("pv_state")
-    fresh = bool(ps) and ps["hash"] == cur_hash and os.path.isdir(ps["dir"])
-    if ps and os.path.isdir(ps["dir"]):
-        if fresh:
-            st.success("Preview sesuai pengaturan saat ini · " + " → ".join(f"{a} ({b})" for a, b in ps["clips"])
-                       + f" · {ps['seconds']:.0f} dtk")
-        else:
-            st.warning("Pengaturan berubah sejak preview dibuat. Buat preview ulang agar tombol "
-                       "'Stream sesuai preview' aktif.")
-        _psrv, _ptn = get_upload_server()
-        auto_base = _ptn.url if _ptn.running and _ptn.url else f"http://localhost:{_psrv.port}"
-        t_hls, t_mp4 = st.tabs(["📺 Pemutar HLS (.m3u8)", "🎞️ MP4 cadangan"])
-        with t_hls:
-            base = st.text_input("Alamat server HLS", auto_base,
-                                 key="pv_base_" + hashlib.md5(auto_base.encode()).hexdigest()[:6],
-                                 help="Lokal: http://localhost:8502. Di Streamlit Cloud: buka tunnel di tab Impor "
-                                      "(alamatnya terisi otomatis).").rstrip("/")
-            st.components.v1.html(
-                HLS_PLAYER.replace("__URL__", f"{base}/hls/{_psrv.token}/{ps['hash']}/index.m3u8"), height=430)
-            st.caption("Tombol 🔍 di bawah pemutar hanya untuk memeriksa detail preview. Efek zoom in/out "
-                       "yang akan tayang sudah ada di dalam videonya.")
-        with t_mp4:
-            if ps.get("mp4") and os.path.exists(ps["mp4"]):
-                st.video(ps["mp4"])
-            else:
-                st.caption("MP4 cadangan tidak tersedia.")
-
-    s1, s2, s3 = st.columns(3)
-    go_prev = s1.button("▶️ Stream sesuai preview", type="primary", disabled=stream.running or not fresh,
-                        width="stretch", help="Aktif setelah preview dibuat dan pengaturan tidak berubah.")
-    go_plain = s2.button("▶️ Mulai tanpa preview", disabled=stream.running, width="stretch")
-    if go_prev or go_plain:
-        if hls_on and not hlsprobe.valid_url(hls_url):
-            st.error("Isi link HLS yang valid (http:// atau https://).")
-        elif not hls_on and not v_rand:
-            st.error("Pilih minimal satu video utama untuk visual selama audio." if program_mode
-                     else "Pilih minimal 1 video acak. Opening bersifat opsional.")
-        elif program_mode and not v_end:
-            st.error("Pilih minimal satu video end untuk mode terjadwal.")
-        elif not a_rand:
-            st.error("Pilih minimal satu file audio.")
-        elif not skey.strip() and not l_local:
-            st.error("Stream key wajib diisi.")
-        else:
-            stream.start(dict(live_cfg), 0 if program_mode else l_hours)
-            st.rerun()
-    if s3.button("⏹️ Stop Live", disabled=not stream.running, width="stretch"):
-        stream.stop()
-        st.rerun()
-
-    @st.fragment(run_every=3)
-    def live_status():
-        icon = {"live": "🔴 LIVE berjalan", "menyiapkan": "🛠️ Menyiapkan file...",
-                "menghubungkan": "🔌 Menghubungkan ke YouTube...", "menyambung ulang": "🔁 Menyambung ulang...",
-                "selesai": "✅ Selesai", "error": "❌ Gagal"}.get(stream.state, "⚪ Tidak streaming")
-        (st.success if stream.state == "live" else st.error if stream.state == "error" else st.warning)(
-            icon + (f" — {stream.detail}" if stream.detail else ""))
-        a, b, c, d, d2 = st.columns(5)
-        a.metric("Uptime", stream.uptime())
-        b.metric("Auto-restart", stream.restarts)
-        pr = stream.progress or {}
-        c.metric("Kecepatan", pr.get("speed", "-") or "-")
-        d.metric("Bitrate", (pr.get("bitrate", "-") or "-").strip())
-        d2.metric("Kualitas kirim", stream.health if stream.running else "-")
-        if stream.running:
-            e, f2_, g = st.columns(3)
-            e.metric("Video diputar", (stream.now_video or "-")[:28])
-            f2_.metric("Audio diputar" if program_mode else "Audio random",
-                       (stream.now_audio or "-")[:28])
-            g.metric("Pergantian video", stream.switches)
-            if stream.prep_info:
-                st.caption("🛠️ " + stream.prep_info)
-        for n in stream.notes:
-            st.caption("• " + n)
-        if stream.running and getattr(stream, "local_dir", ""):
-            _ls, _lt = get_upload_server()
-            _lb = (_lt.url if _lt.running and _lt.url else f"http://localhost:{_ls.port}").rstrip("/")
-            st.components.v1.html(HLS_PLAYER.replace("__URL__", f"{_lb}/hls/{_ls.token}/live/index.m3u8"),
-                                  height=430)
-        with st.expander("Log ffmpeg"):
-            st.code(stream.log_tail() or "(kosong)", language="text")
-
-    live_status()
-
-# ───────────── LIVE VIDEO BERURUTAN ─────────────
-SQ_RTMP = {"RTMP YouTube (standar)": "rtmp://a.rtmp.youtube.com/live2",
-           "RTMPS YouTube (terenkripsi, lebih tahan putus)": "rtmps://a.rtmps.youtube.com:443/live2",
-           "Kustom": ""}
-
-
-def _sq_items() -> list:
-    return list(st.session_state.get("sq_order", []))
-
-
-def _sq_add():
-    add = [str(p) for p in (st.session_state.get("sq_add") or [])]
-    st.session_state["sq_order"] = [*_sq_items(), *add]
-    st.session_state["sq_add"] = []
-
-
-def _sq_move(i: int, delta: int):
-    o = _sq_items()
-    j = i + delta
-    if 0 <= i < len(o) and 0 <= j < len(o):
-        o[i], o[j] = o[j], o[i]
-        st.session_state["sq_order"] = o
-
-
-def _sq_top(i: int):
-    o = _sq_items()
-    if 0 < i < len(o):
-        o.insert(0, o.pop(i))
-        st.session_state["sq_order"] = o
-
-
-def _sq_del(i: int):
-    o = _sq_items()
-    if 0 <= i < len(o):
-        o.pop(i)
-        st.session_state["sq_order"] = o
-
-
-def _sq_clear():
-    st.session_state["sq_order"] = []
-
-
-def _sq_sort():
-    st.session_state["sq_order"] = sorted(_sq_items(), key=lambda s: Path(s).name.lower())
-
-
-def _sq_shuffle():
-    o = _sq_items()
-    random.shuffle(o)
-    st.session_state["sq_order"] = o
-
-
-with tab_seq:
-    st.markdown("### 🎞️ Live video berurutan (hanya video)")
-    st.caption("Susun video dalam urutan yang kamu mau, lalu siarkan **sekali jalan** atau **loop** dari video "
-               "pertama sampai terakhir tanpa henti (cocok untuk live 24 jam). Tidak butuh file audio terpisah: "
-               "audio ikut dari tiap video, atau dibuat senyap. Koneksi ke YouTube tidak putus saat berganti video.")
-
-    sq_vlib = svc.library_videos()
-    if not sq_vlib:
-        st.warning("Library video masih kosong. Tambahkan video di tab Impor.")
-    order = [p for p in _sq_items() if Path(p).is_file()]          # buang file yang sudah dihapus dari Library
-    if order != _sq_items():
-        st.session_state["sq_order"] = order
-
-    # ── 1. susun urutan ──
-    st.markdown("#### 1️⃣ Susun urutan video")
-    a1, a2 = st.columns([5, 1.2], vertical_alignment="bottom")
-    a1.multiselect("Tambah video ke urutan (sesuai urutan klik; video yang sama boleh ditambahkan lagi)",
-                   sq_vlib, format_func=svc.label, key="sq_add", placeholder="Pilih satu atau beberapa video...")
-    a2.button("➕ Tambahkan", key="sq_addbtn", on_click=_sq_add, width="stretch",
-              disabled=not st.session_state.get("sq_add"))
-
-    if order:
-        for i, ps in enumerate(order):
-            p = Path(ps)
-            c0, c1, c2, c3, c4, c5, c6 = st.columns([0.5, 5, 1.2, 0.6, 0.6, 0.6, 0.6], vertical_alignment="center")
-            c0.markdown(f"**{i + 1}**")
-            c1.write(svc.label(p))
-            c2.caption(_mmss(_dur(ps, p.stat().st_mtime)))
-            c3.button("⏫", key=f"sq_top_{i}", on_click=_sq_top, args=(i,), disabled=i == 0,
-                      help="Pindahkan ke paling atas")
-            c4.button("🔼", key=f"sq_up_{i}", on_click=_sq_move, args=(i, -1), disabled=i == 0,
-                      help="Naik satu posisi")
-            c5.button("🔽", key=f"sq_dn_{i}", on_click=_sq_move, args=(i, 1), disabled=i == len(order) - 1,
-                      help="Turun satu posisi")
-            c6.button("❌", key=f"sq_rm_{i}", on_click=_sq_del, args=(i,), help="Hapus dari urutan")
-        t1, t2, t3, _ = st.columns([1, 1, 1, 3])
-        t1.button("🔤 Urut A–Z", key="sq_sort", on_click=_sq_sort, width="stretch")
-        t2.button("🔀 Acak sekali", key="sq_shuf", on_click=_sq_shuffle, width="stretch",
-                  help="Mengacak urutan satu kali sekarang; urutan tetap sama setiap putaran.")
-        t3.button("🧹 Kosongkan", key="sq_clr", on_click=_sq_clear, width="stretch")
-        total_sec = sum(_dur(str(p), Path(p).stat().st_mtime) for p in order)
-    else:
-        st.info("Urutan masih kosong. Pilih video di atas lalu klik **Tambahkan**.")
-        total_sec = 0.0
-
-    # ── 2. mode putar ──
-    st.markdown("#### 2️⃣ Mode putar & audio")
-    m1, m2 = st.columns(2)
-    sq_mode = m1.radio("Mode putar", ["loop", "once"], horizontal=False, key="sq_mode",
-                       format_func={"loop": "🔁 Loop — setelah video terakhir, ulang dari video pertama",
-                                    "once": "1️⃣ Sekali jalan — berhenti otomatis setelah video terakhir"}.get)
-    sq_audio = m2.radio("Audio", ["video", "silent"], key="sq_audio",
-                        format_func={"video": "🔊 Pakai audio bawaan video (video tanpa audio otomatis hening)",
-                                     "silent": "🔇 Senyap (video saja, trek hening dikirim)"}.get)
-    v1, v2 = st.columns(2)
-    if "sq_start" in st.session_state:                    # jaga nilai tetap di dalam rentang saat daftar memendek
-        st.session_state["sq_start"] = max(1, min(int(st.session_state["sq_start"]), max(1, len(order))))
-    sq_vol = v1.slider("Volume audio video", 0.0, 2.0, 1.0, 0.05, key="sq_vol", disabled=sq_audio == "silent",
-                       help="1,00 = asli. Berlaku saat live dimulai.")
-    sq_start = v2.number_input("Mulai dari video nomor", 1, max(1, len(order)), 1, 1, key="sq_start",
-                               disabled=not order, help="Putaran pertama dimulai dari nomor ini; putaran "
-                                                         "berikutnya (mode loop) selalu dari nomor 1.")
-    if order:
-        if sq_mode == "loop":
-            st.info(f"{len(order)} video · satu putaran {_mmss(total_sec)} · dalam 24 jam ≈ "
-                    f"{86400 / max(total_sec, 1):.1f} putaran. Setelah video ke-{len(order)} langsung kembali "
-                    "ke video 1 sampai kamu menekan Stop.")
-        else:
-            st.info(f"{len(order)} video · total {_mmss(total_sec)}. Setelah video ke-{len(order)} selesai, "
-                    "live berhenti sendiri.")
-
-    sq_fx = fx_panel("sfx")
-    sq_fx_on = fxm.active(sq_fx)
-    for _w in fxm.warnings(sq_fx):
-        st.warning(_w)
-    if sq_fx_on and order:
-        st.caption(f"Efek aktif: {fxm.describe(sq_fx)}. Putaran pertama di-transkode langsung sambil efek "
-                   "dibakar ke cache di background; putaran berikutnya memakai cache (CPU ≈ 0). Bisa juga "
-                   "dibakar dulu lewat tab Live 24 Jam (tombol 🔥) dengan efek dan resolusi yang sama.")
-
-    # ── 3. tujuan ──
-    st.markdown("#### 3️⃣ Tujuan siaran")
-    d0, d1, d2 = st.columns([1.2, 1.2, 1])
-    sq_srv = d0.selectbox("Server tujuan", list(SQ_RTMP), key="sq_srv")
-    sq_rtmp = d1.text_input("RTMP URL", SQ_RTMP[sq_srv] or "rtmp://", key=f"sq_rtmp_{sq_srv}",
-                            disabled=sq_srv != "Kustom")
-    sq_key = d2.text_input("Stream Key", type="password", key="sq_key")
-
-    with st.expander("⚙️ Pengaturan lanjutan"):
-        sq_vmode = st.radio("Mode video", ["auto", "normalize", "copy"], horizontal=True, key="sq_vmode",
-                            format_func={"auto": "Otomatis (disarankan)", "normalize": "Selalu samakan",
-                                         "copy": "Kirim apa adanya"}.get,
-                            help="Otomatis: video yang sudah seragam & cocok untuk live dikirim apa adanya (CPU ≈ 0); "
-                                 "yang lain disamakan ke H.264 seragam (di-cache). Format target mengikuti video "
-                                 "nomor 1 bila sudah layak live, selain itu pengaturan di bawah.")
-        q1, q2, q3 = st.columns(3)
-        sq_h = q1.selectbox("Resolusi (jika disamakan)", [480, 720, 1080], index=1, key="sq_h")
-        sq_fps = q2.selectbox("FPS (jika disamakan)", [24, 25, 30], index=2, key="sq_fps")
-        sq_br = q3.selectbox("Bitrate video kbps (jika disamakan)", [0, 1500, 2500, 4000, 6000], index=0, key="sq_br",
-                             format_func=lambda b: "Auto (sesuai resolusi, disarankan)" if b == 0 else str(b))
-        q4, q5 = st.columns(2)
-        sq_hours = q4.number_input("Batas durasi (jam, 0 = tanpa batas)", 0.0, 720.0, 0.0, 1.0, key="sq_hours")
-        sq_local = q5.checkbox("Mode uji lokal (tidak mengirim ke YouTube)", key="sq_local",
-                               help="Keluaran ditulis sebagai HLS lokal dan bisa diputar di bawah. "
-                                    "Stream key tidak diperlukan.")
-
-    seq_cfg = {"seq_mode": True, "seq_videos": list(order), "seq_loop": sq_mode == "loop",
-               "seq_audio": sq_audio, "seq_volume": sq_vol, "seq_start": int(sq_start),
-               "videos": list(dict.fromkeys(order)), "audios": [], "a_loop": [], "a_rand": [],
-               "v_open": [], "v_rand": [], "v_end": [], "program_mode": False,
-               "rtmp_url": sq_rtmp.strip(), "stream_key": sq_key.strip(),
-               "vmode": sq_vmode, "height": sq_h, "fps": sq_fps, "vbr_k": sq_br,
-               "shuffle": False, "disk_min_gb": disk_min, "fx": sq_fx, "hls_url": "", "hls_vod": False,
-               "local_dir": str(svc.LOCAL_LIVE_DIR) if sq_local else ""}
-
-    sq_errors = []
-    if not order:
-        sq_errors.append("Urutan video masih kosong.")
-    if not sq_local:
-        if not sq_key.strip():
-            sq_errors.append("Stream Key wajib diisi (atau aktifkan mode uji lokal).")
-        if not sq_rtmp.strip().lower().startswith(("rtmp://", "rtmps://")):
-            sq_errors.append("RTMP URL harus diawali rtmp:// atau rtmps://.")
-    for _e in sq_errors:
-        if order:                      # pesan "urutan kosong" sudah ditampilkan di atas
-            st.warning(_e)
-
-    b1, b2, _ = st.columns([1.3, 1, 2])
-    if b1.button("▶️ Mulai live berurutan", type="primary", key="sq_start_btn", disabled=stream.running,
-                 width="stretch"):
-        if sq_errors:
-            st.error("Lengkapi dulu: " + " ".join(sq_errors))
-        else:
-            stream.start(dict(seq_cfg), sq_hours)
-            st.rerun()
-    if b2.button("⏹️ Stop Live", key="sq_stop_btn", disabled=not stream.running, width="stretch"):
-        stream.stop()
-        st.rerun()
-
-    @st.fragment(run_every=3)
-    def seq_status():
-        if stream.running and not stream.is_seq:
-            st.info("Live sedang berjalan dari tab lain (Live 24 Jam / Multi-stream). Hentikan dulu dari tab "
-                    "tersebut untuk memulai live berurutan.")
-            return
-        if not stream.is_seq:
-            st.caption("⚪ Belum ada live berurutan.")
-            return
-        icon = {"live": "🔴 LIVE berjalan", "menyiapkan": "🛠️ Menyiapkan file...",
-                "menghubungkan": "🔌 Menghubungkan ke YouTube...", "menyambung ulang": "🔁 Menyambung ulang...",
-                "selesai": "✅ Semua video selesai diputar — live dihentikan", "error": "❌ Gagal"
-                }.get(stream.state, "⚪ Tidak streaming")
-        (st.success if stream.state in ("live", "selesai") else st.error if stream.state == "error"
-         else st.warning)(icon + (f" — {stream.detail}" if stream.detail else ""))
-        a, b, c, d, e = st.columns(5)
-        a.metric("Uptime", stream.uptime())
-        b.metric("Auto-restart", stream.restarts)
-        pr = stream.progress or {}
-        c.metric("Kecepatan", pr.get("speed", "-") or "-")
-        d.metric("Bitrate", (pr.get("bitrate", "-") or "-").strip())
-        e.metric("Kualitas kirim", stream.health if stream.running else "-")
-        if stream.running and stream.seq_total:
-            pos = min(stream._seq_play + 1, stream.seq_total)
-            st.progress(pos / stream.seq_total,
-                        text=f"Video {pos}/{stream.seq_total}"
-                             + (f" · putaran ke-{stream.seq_cycle + 1}" if stream.seq_loop else " · sekali jalan"))
-            f, g = st.columns(2)
-            f.metric("Sedang tayang", (stream.now_video or "-")[:34])
-            g.metric("Pergantian video", stream.switches)
-            if stream.prep_info:
-                st.caption("🛠️ " + stream.prep_info)
-        for n in stream.notes:
-            st.caption("• " + n)
-        if stream.running and getattr(stream, "local_dir", ""):
-            _ls, _lt = get_upload_server()
-            _lb = (_lt.url if _lt.running and _lt.url else f"http://localhost:{_ls.port}").rstrip("/")
-            st.components.v1.html(HLS_PLAYER.replace("__URL__", f"{_lb}/hls/{_ls.token}/live/index.m3u8"),
-                                  height=430)
-        with st.expander("Log ffmpeg"):
-            st.code(stream.log_tail() or "(kosong)", language="text")
-
-    seq_status()
-
-# ───────────── JADWAL MULTI-STREAM ─────────────
-with tab_playlist:
-    st.markdown("### Multi-stream berurutan")
-    st.caption(
-        "Tekan mulai untuk menjalankan Stream 1 sekarang. Semua audio diputar penuh satu kali, lalu video end "
-        "diputar penuh; setelah itu koneksi FFmpeg ditutup dan stream berikutnya langsung dimulai. "
-        "Setiap stream memakai pilihan media dan Stream Key sendiri."
-    )
-    st.info(
-        "Gunakan **YouTube Stream Key** dari Live Control Room, bukan Google API key. "
-        "Stream Key disimpan sebagai input tersembunyi dan disamarkan pada log."
-    )
-
-    st.session_state.setdefault("ms_count", 2)
-    add_col, remove_col, count_col = st.columns([1, 1, 2])
-    if add_col.button("＋ Tambah stream", key="ms_add",
-                      disabled=st.session_state["ms_count"] >= 12):
-        st.session_state["ms_count"] += 1
-        st.rerun()
-    if remove_col.button("− Hapus stream terakhir", key="ms_remove",
-                         disabled=st.session_state["ms_count"] <= 2):
-        removed = st.session_state["ms_count"]
-        for key in list(st.session_state):
-            if key.startswith(f"ms_{removed}_"):
-                del st.session_state[key]
-        st.session_state["ms_count"] -= 1
-        st.rerun()
-    count_col.caption(f"{st.session_state['ms_count']} stream terdaftar · maksimal 12")
-
-    vlib = svc.library_videos()
-    alib = svc.list_paths("audio")
-    if not vlib:
-        st.warning("Library video masih kosong. Tambahkan video di tab Impor sebelum membuat jadwal.")
-    if not alib:
-        st.warning("Library audio masih kosong. Tambahkan audio di tab Impor sebelum membuat jadwal.")
-
-    playlist_configs = []
-    playlist_errors = []
-    playlist_rtmp_presets = {
-        "RTMP YouTube (standar)": "rtmp://a.rtmp.youtube.com/live2",
-        "RTMPS YouTube (terenkripsi)": "rtmps://a.rtmps.youtube.com:443/live2",
-        "Kustom": "",
-    }
-    for stream_no in range(1, st.session_state["ms_count"] + 1):
-        prefix = f"ms_{stream_no}_"
-        with st.expander(f"Stream {stream_no} — pengaturan video, audio, dan tujuan", expanded=stream_no == 1):
-            stream_name = st.text_input(
-                "Nama stream", value=f"Stream {stream_no}", key=prefix + "name"
-            ).strip() or f"Stream {stream_no}"
-
-            opening_on = st.checkbox(
-                "Putar opening opsional satu kali", value=True, key=prefix + "opening_on"
-            )
-            opening_videos = st.multiselect(
-                "Video opening (acak jika memilih beberapa)",
-                vlib,
-                format_func=svc.label,
-                key=prefix + "opening",
-                disabled=not opening_on,
-                placeholder="Opsional — pilih video opening",
-            )
-
-            video_mode_label = st.radio(
-                "Video utama selama audio",
-                ["Acak beberapa video", "Ulangi satu video"],
-                horizontal=True,
-                key=prefix + "video_mode",
-            )
-            if video_mode_label == "Ulangi satu video":
-                single_video = st.selectbox(
-                    "Pilih video utama",
-                    vlib,
-                    index=None,
-                    format_func=svc.label,
-                    key=prefix + "single_video",
-                    placeholder="Pilih satu video...",
-                    disabled=not vlib,
-                )
-                main_videos = [single_video] if single_video else []
-                program_video_mode = "single"
-            else:
-                main_videos = st.multiselect(
-                    "Video utama (diputar penuh dan diacak)",
-                    vlib,
-                    format_func=svc.label,
-                    key=prefix + "main_videos",
-                    placeholder="Pilih satu atau beberapa video...",
-                )
-                program_video_mode = "random"
-
-            end_videos = st.multiselect(
-                "Video end (diputar penuh sebelum berpindah)",
-                vlib,
-                format_func=svc.label,
-                key=prefix + "end_videos",
-                placeholder="Pilih minimal satu video end...",
-            )
-
-            audio_files = st.multiselect(
-                "Audio untuk stream ini",
-                alib,
-                format_func=svc.label,
-                key=prefix + "audio",
-                placeholder="Pilih satu atau beberapa file audio...",
-            )
-            selected_audio_seconds = sum(
-                _dur(str(path), path.stat().st_mtime) for path in audio_files
-            )
-            audio_mode_label = st.radio(
-                "Urutan audio",
-                ["Urutan pilihan", "Acak satu kali"],
-                horizontal=True,
-                key=prefix + "audio_mode",
-            )
-            program_audio_mode = {
-                "Urutan pilihan": "full",
-                "Acak satu kali": "shuffle",
-            }[audio_mode_label]
-            program_audio_seconds = selected_audio_seconds
-            st.caption(f"Durasi audio terpilih: {_mmss(selected_audio_seconds)}")
-
-            srv = st.selectbox(
-                "Server tujuan",
-                list(playlist_rtmp_presets),
-                key=prefix + "server",
-            )
-            rtmp_input = st.text_input(
-                "RTMP URL",
-                value=playlist_rtmp_presets[srv] or "rtmp://",
-                key=prefix + "rtmp_custom",
-                disabled=srv != "Kustom",
-                help="Tujuan RTMP dapat berbeda untuk setiap stream.",
-            )
-            rtmp_url = rtmp_input if srv == "Kustom" else playlist_rtmp_presets[srv]
-            stream_key = st.text_input(
-                "YouTube Stream Key",
-                type="password",
-                key=prefix + "stream_key",
-                placeholder="Masukkan Stream Key untuk stream ini",
-            ).strip()
-
-            with st.container(border=True):      # bukan expander: Streamlit melarang expander bersarang
-                st.markdown(f"**Pengaturan lanjutan — {stream_name}**")
-                vmode_label = st.radio(
-                    "Mode video",
-                    ["Otomatis", "Selalu samakan", "Kirim apa adanya"],
-                    horizontal=True,
-                    key=prefix + "vmode",
-                )
-                vmode = {
-                    "Otomatis": "auto",
-                    "Selalu samakan": "normalize",
-                    "Kirim apa adanya": "copy",
-                }[vmode_label]
-                resolution_col, fps_col, bitrate_col = st.columns(3)
-                height = resolution_col.selectbox(
-                    "Resolusi jika disamakan", [480, 720, 1080], index=1,
-                    key=prefix + "height",
-                )
-                fps = fps_col.selectbox(
-                    "FPS jika disamakan", [24, 25, 30], index=2,
-                    key=prefix + "fps",
-                )
-                vbr_k = bitrate_col.selectbox(
-                    "Bitrate video (kbps)",
-                    [0, 1500, 2500, 4000, 6000],
-                    format_func=lambda value: "Otomatis" if value == 0 else str(value),
-                    key=prefix + "vbr",
-                )
-                shuffle_video = st.checkbox(
-                    "Acak video pada tiap pergantian", value=True, key=prefix + "shuffle"
-                )
-                volume = st.slider(
-                    "Volume audio", 0.0, 2.0, 1.0, 0.05, key=prefix + "volume"
-                )
-
-            fx_cfg_ms = fx_panel(prefix + "fx")
-            active_opening = opening_videos if opening_on else []
-            all_videos = list(dict.fromkeys([*active_opening, *main_videos, *end_videos]))
-            playlist_configs.append({
-                "playlist_name": stream_name,
-                "videos": all_videos,
-                "audios": list(audio_files),
-                "v_open": list(active_opening),
-                "v_rand": list(main_videos),
-                "v_end": list(end_videos),
-                "program_mode": True,
-                "program_video_mode": program_video_mode,
-                "program_audio_mode": program_audio_mode,
-                "program_audio_seconds": program_audio_seconds,
-                "a_loop": [],
-                "a_rand": list(audio_files),
-                "vol_rand": volume,
-                "rtmp_url": rtmp_url.strip(),
-                "stream_key": stream_key,
-                "vmode": vmode,
-                "height": height,
-                "fps": fps,
-                "vbr_k": vbr_k,
-                "shuffle": shuffle_video,
-                "disk_min_gb": disk_min,
-                "fx": fx_cfg_ms,
-            })
-            if not main_videos:
-                playlist_errors.append(f"Stream {stream_no}: pilih minimal satu video utama.")
-            if not end_videos:
-                playlist_errors.append(f"Stream {stream_no}: pilih minimal satu video end.")
-            if not audio_files:
-                playlist_errors.append(f"Stream {stream_no}: pilih minimal satu file audio.")
-            if not stream_key:
-                playlist_errors.append(f"Stream {stream_no}: Stream Key wajib diisi.")
-            if not rtmp_url.strip().lower().startswith(("rtmp://", "rtmps://")):
-                playlist_errors.append(f"Stream {stream_no}: RTMP URL harus diawali rtmp:// atau rtmps://.")
-
-    st.markdown("#### Stream terakhir: berhenti")
-    with st.container(border=True):
-        st.write("**Slot kosong / STOP — otomatis setelah stream terakhir selesai**")
-        st.caption(
-            "Tidak ada server atau Stream Key pada slot ini. FFmpeg dan koneksi ke YouTube dihentikan; "
-            "tidak ada nilai 0 atau key kosong yang dikirim."
-        )
-
-    if playlist_errors:
-        st.warning("Periksa konfigurasi sebelum memulai:\n\n" + "\n".join(f"• {item}" for item in playlist_errors))
-
-    start_col, stop_col = st.columns(2)
-    if start_col.button(
-        "▶️ Mulai multi-stream sekarang",
-        type="primary",
-        key="ms_start",
-        disabled=stream.running,
-        width="stretch",
-    ):
-        if playlist_errors:
-            st.error("Jadwal belum lengkap. Lengkapi setiap stream dan periksa pesan di atas.")
-        else:
-            try:
-                stream.start_playlist(playlist_configs)
-                st.rerun()
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Jadwal tidak dapat dimulai: {exc}")
-    if stop_col.button(
-        "⏹️ Hentikan jadwal",
-        key="ms_stop",
-        disabled=not stream.running,
-        width="stretch",
-    ):
-        stream.stop()
-        st.rerun()
-
-    @st.fragment(run_every=3)
-    def playlist_status():
-        icon = {
-            "live": "🔴 LIVE berjalan",
-            "beralih": "⏭️ Beralih ke stream berikutnya",
-            "menyiapkan": "🛠️ Menyiapkan stream",
-            "menghubungkan": "🔌 Menghubungkan ke YouTube",
-            "menyambung ulang": "🔁 Menyambung ulang",
-            "selesai": "✅ Semua stream selesai — FFmpeg dihentikan",
-            "error": "❌ Urutan streaming gagal",
-        }.get(stream.state, "⚪ Tidak streaming")
-        (st.success if stream.state == "live" else st.error if stream.state == "error" else st.info)(
-            icon + (f" — {stream.detail}" if stream.detail else "")
-        )
-        if stream.playlist_total:
-            current_name = stream.playlist_name or "Belum dimulai"
-            st.caption(
-                f"Urutan: {stream.playlist_index}/{stream.playlist_total} · "
-                f"{current_name} · uptime {stream.uptime()}"
-            )
-        if stream.running:
-            a, b, c = st.columns(3)
-            a.metric("Video", (stream.now_video or "-")[:32])
-            b.metric("Audio", (stream.now_audio or "-")[:32])
-            c.metric("Kualitas kirim", stream.health or "-")
-        with st.expander("Log FFmpeg / jadwal"):
-            st.code(stream.log_tail() or "(belum ada log)", language="text")
-
-    playlist_status()
-
-# ───────────── JOB ─────────────
 with tab_jobs:
     b1, b2, b3 = st.columns(3)
     if b1.button("🔁 Coba ulang yang gagal", key="pj_retry"):
@@ -1669,8 +988,8 @@ with tab_jobs:
     @st.fragment(run_every=3)
     def jobs_panel():
         rm = jobs.snapshot()
-        if rm:                                   # panel Render/Merge dihapus; job lama tetap terlihat di sini
-            st.markdown("**Normalisasi, Render & Merge**")
+        if rm:                                   
+            st.markdown("**Render & Normalisasi**")
             jobs_table(rm)
         st.markdown("**Impor / Unduhan**")
         jobs_table(dl_jobs.snapshot())
